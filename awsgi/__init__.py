@@ -3,6 +3,10 @@ from io import BytesIO
 import itertools
 import collections
 import sys
+import gzip
+
+ONE_MTU_SIZE = 1400
+
 try:
     # Python 3
     from urllib.parse import urlencode
@@ -28,15 +32,16 @@ except ImportError:
         return b.encode('utf-8', errors='strict') if (
             isinstance(b, (str, unicode))) else b
 
+
 __all__ = 'response',
 
 
-def convert_b46(s):
+def convert_base64(s):
     return b64encode(s).decode('ascii')
 
 
 class StartResponse(object):
-    def __init__(self, base64_content_types=None):
+    def __init__(self, base64_content_types=None, use_gzip=False):
         '''
         Args:
             base64_content_types (set): Set of HTTP Content-Types which should
@@ -46,6 +51,7 @@ class StartResponse(object):
         self.status = 500
         self.status_line = '500 Internal Server Error'
         self.headers = []
+        self.use_gzip = use_gzip
         self.chunks = collections.deque()
         self.base64_content_types = set(base64_content_types or []) or set()
 
@@ -62,15 +68,36 @@ class StartResponse(object):
             content_type = content_type.split(';')[0]
         return content_type in self.base64_content_types
 
+    def use_gzip_response(self, headers, body):
+        content_type = headers.get('Content-Type')
+        return self.use_gzip and content_type in {
+            "application/javascript",
+            "application/json",
+            "text/css",
+            "text/html",
+            "text/plain",
+            "text/html",
+            "image/svg+xml",
+            "font/otf",
+            "font/ttf"
+        } and len(body) > ONE_MTU_SIZE
+
     def build_body(self, headers, output):
         totalbody = b''.join(itertools.chain(
             self.chunks, output,
         ))
 
+        is_gzip = self.use_gzip_response(headers, totalbody)
         is_b64 = self.use_binary_response(headers, totalbody)
+        print(f"IS_GZIP = {is_gzip}")
+        print(f"is_b64 = {is_b64}")
+        if is_gzip:
+            totalbody = gzip.compress(totalbody)
+            headers["Content-Encoding"] = "gzip"
+            is_b64 = True
 
         if is_b64:
-            converted_output = convert_b46(totalbody)
+            converted_output = convert_base64(totalbody)
         else:
             converted_output = convert_str(totalbody)
 
@@ -110,6 +137,9 @@ class StartResponse_ELB(StartResponse):
 
 
 def environ(event, context):
+    # Check if format version is in v2, used for determining where to retrieve http method and path
+    is_v2 = '2.0' in event.get('version', {})
+
     body = event.get('body', '') or ''
 
     if event.get('isBase64Encoded', False):
@@ -118,12 +148,15 @@ def environ(event, context):
     body = convert_byte(body)
 
     environ = {
-        'REQUEST_METHOD': event['httpMethod'],
+        # Get http method from within requestContext.http field in V2 format
+        'REQUEST_METHOD': event['requestContext']['http']['method'] if is_v2 else event['httpMethod'],
         'SCRIPT_NAME': '',
         'SERVER_NAME': '',
         'SERVER_PORT': '',
-        'PATH_INFO': event['path'],
-        'QUERY_STRING': urlencode(event['queryStringParameters'] or {}),
+        # Get path from within requestContext.http field in V2 format
+        'PATH_INFO': event['requestContext']['http']['path'] if is_v2 else event['path'],
+        # Use get() to access queryStringParameter field without throwing error if it doesn't exist
+        'QUERY_STRING': urlencode(event.get('queryStringParameters') or {}),
         'REMOTE_ADDR': '127.0.0.1',
         'CONTENT_LENGTH': str(len(body)),
         'HTTP': 'on',
@@ -144,6 +177,8 @@ def environ(event, context):
 
         if k == 'CONTENT_TYPE':
             environ['CONTENT_TYPE'] = v
+        elif k == 'ACCEPT_ENCODING':
+            environ['ACCEPT_ENCODING'] = v
         elif k == 'HOST':
             environ['SERVER_NAME'] = v
         elif k == 'X_FORWARDED_FOR':
@@ -166,8 +201,12 @@ def select_impl(event, context):
 
 
 def response(app, event, context, base64_content_types=None):
+
     environ, StartResponse = select_impl(event, context)
 
-    sr = StartResponse(base64_content_types=base64_content_types)
+    use_gzip = bool("gzip" in event.get("headers", {}).get('accept-encoding', ""))
+    sr = StartResponse(base64_content_types=base64_content_types, use_gzip=use_gzip)
     output = app(environ(event, context), sr)
-    return sr.response(output)
+    response = sr.response(output)
+
+    return response
